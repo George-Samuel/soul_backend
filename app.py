@@ -8,6 +8,12 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
+# ========== HEALTHCHECK (для Render) ==========
+@app.route('/')
+def home():
+    return jsonify({'status': 'ok', 'message': 'Soul Pair API is running'}), 200
+
+# ========== ОСНОВНЫЕ НАСТРОЙКИ ==========
 PROFILES_FILE = 'profiles.json'
 MESSAGES_FILE = 'messages.json'
 HEARTBEAT_FILE = 'heartbeats.json'
@@ -336,6 +342,7 @@ def stats():
         'online_now': online_now,
     }), 200
 
+# ========== ЗАПУСК ==========
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
