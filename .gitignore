@@ -1,0 +1,10 @@
+venv/
+pycache/
+*.pyc
+*.log
+profiles.json
+messages.json
+heartbeats.json
+last_read.json
+reports.json
+.env
