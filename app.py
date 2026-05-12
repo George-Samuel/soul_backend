@@ -8,13 +8,57 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
+# ----- Healthcheck -----
+@app.route('/')
+def home():
+    return jsonify({'status': 'ok', 'message': 'Soul Pair API is running'}), 200
+
+# ----- Определяем, использовать ли базу данных -----
+DATABASE_URL = os.environ.get('DATABASE_URL')
+USE_DB = DATABASE_URL is not None
+
+if USE_DB:
+    # Импортируем SQLAlchemy только если будем использовать БД
+    from flask_sqlalchemy import SQLAlchemy
+    app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+    app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+        'pool_pre_ping': True,
+        'pool_recycle': 300,
+    }
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    db = SQLAlchemy(app)
+
+    class Profile(db.Model):
+        __tablename__ = 'profiles'
+        user_id = db.Column(db.String, primary_key=True)
+        data = db.Column(db.JSON, nullable=False)
+        updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    class Message(db.Model):
+        __tablename__ = 'messages'
+        id = db.Column(db.Integer, primary_key=True)
+        from_user = db.Column(db.String, nullable=False)
+        to_user = db.Column(db.String, nullable=False)
+        text = db.Column(db.Text, nullable=False)
+        timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+    with app.app_context():
+        db.create_all()
+    print("✅ Подключена база данных Neon.tech")
+else:
+    print("⚠️ DATABASE_URL не задана, работаем с JSON-файлами")
+    # Заглушки, чтобы в остальном коде не было ошибок
+    db = None
+    Profile = None
+    Message = None
+
+# ----- Остальные настройки и функции (JSON, общие) -----
 PROFILES_FILE = 'profiles.json'
 MESSAGES_FILE = 'messages.json'
 HEARTBEAT_FILE = 'heartbeats.json'
 LAST_READ_FILE = 'last_read.json'
 REPORTS_FILE = 'reports.json'
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def load_json(file):
     if os.path.exists(file):
         with open(file, 'r', encoding='utf-8') as f:
@@ -25,19 +69,146 @@ def save_json(file, data):
     with open(file, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# ========== ПРОФИЛИ ==========
-def load_profiles():
-    return load_json(PROFILES_FILE)
+# ----- Универсальные функции работы с профилями -----
+def get_profile_data(user_id):
+    if USE_DB and Profile:
+        profile = Profile.query.get(user_id)
+        return profile.data if profile else None
+    else:
+        profiles = load_json(PROFILES_FILE)
+        return profiles.get(user_id)
 
-def save_profiles(profiles):
-    save_json(PROFILES_FILE, profiles)
-
-profiles = load_profiles()
+def save_profile_data(user_id, data):
+    if USE_DB and Profile:
+        profile = Profile.query.get(user_id)
+        if profile:
+            profile.data = data
+            profile.updated_at = datetime.utcnow()
+        else:
+            profile = Profile(user_id=user_id, data=data)
+            db.session.add(profile)
+        db.session.commit()
+    else:
+        profiles = load_json(PROFILES_FILE)
+        profiles[user_id] = data
+        save_json(PROFILES_FILE, profiles)
 
 def is_admin(user_id):
-    user = profiles.get(user_id)
-    return user is not None and user.get('is_admin', False)
+    profile = get_profile_data(user_id)
+    return profile is not None and profile.get('is_admin', False)
 
+# ----- Сообщения -----
+def save_message_db(from_user, to_user, text):
+    if USE_DB and Message:
+        msg = Message(from_user=from_user, to_user=to_user, text=text)
+        db.session.add(msg)
+        db.session.commit()
+        return msg.id
+    else:
+        msg_db = load_json(MESSAGES_FILE)
+        msg_id = msg_db.get('next_id', 1)
+        msg = {
+            'id': msg_id,
+            'from': from_user,
+            'to': to_user,
+            'text': text,
+            'timestamp': datetime.now().isoformat()
+        }
+        msg_db.setdefault('messages', []).append(msg)
+        msg_db['next_id'] = msg_id + 1
+        save_json(MESSAGES_FILE, msg_db)
+        return msg_id
+
+def get_dialog_db(user1, user2, last_id):
+    if USE_DB and Message:
+        query = Message.query.filter(
+            ((Message.from_user == user1) & (Message.to_user == user2)) |
+            ((Message.from_user == user2) & (Message.to_user == user1))
+        ).filter(Message.id > last_id).order_by(Message.id.asc())
+        return [{
+            'id': m.id,
+            'from': m.from_user,
+            'to': m.to_user,
+            'text': m.text,
+            'timestamp': m.timestamp.isoformat()
+        } for m in query.all()]
+    else:
+        msg_db = load_json(MESSAGES_FILE)
+        return [m for m in msg_db.get('messages', [])
+                if ((m['from'] == user1 and m['to'] == user2) or
+                    (m['from'] == user2 and m['to'] == user1))
+                and m['id'] > last_id]
+
+def get_messages_for_user(user_id, last_id):
+    if USE_DB and Message:
+        query = Message.query.filter(Message.to_user == user_id, Message.id > last_id)
+        return [{
+            'id': m.id,
+            'from': m.from_user,
+            'to': m.to_user,
+            'text': m.text,
+            'timestamp': m.timestamp.isoformat()
+        } for m in query.all()]
+    else:
+        msg_db = load_json(MESSAGES_FILE)
+        return [m for m in msg_db.get('messages', [])
+                if m['to'] == user_id and m['id'] > last_id]
+
+def get_all_profiles_exclude(exclude_user):
+    if USE_DB and Profile:
+        all_profiles = Profile.query.all()
+        return {p.user_id: p.data for p in all_profiles if p.user_id != exclude_user}
+    else:
+        profiles = load_json(PROFILES_FILE)
+        if exclude_user:
+            return {uid: p for uid, p in profiles.items() if uid != exclude_user}
+        return profiles
+
+def delete_user_completely(user_id):
+    if USE_DB and Profile and Message:
+        profile = Profile.query.get(user_id)
+        if profile:
+            db.session.delete(profile)
+        Message.query.filter((Message.from_user == user_id) | (Message.to_user == user_id)).delete()
+        db.session.commit()
+    else:
+        profiles = load_json(PROFILES_FILE)
+        if user_id in profiles:
+            del profiles[user_id]
+            save_json(PROFILES_FILE, profiles)
+        msg_db = load_json(MESSAGES_FILE)
+        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != user_id]
+        save_json(MESSAGES_FILE, msg_db)
+    # удалить также из heartbeat, last_read
+    hb = load_heartbeats()
+    if user_id in hb:
+        del hb[user_id]
+    save_heartbeats(hb)
+    lr = load_last_read()
+    if user_id in lr:
+        del lr[user_id]
+    save_last_read(lr)
+
+# ----- Heartbeat, last_read (остаются на JSON) -----
+def load_heartbeats():
+    return load_json(HEARTBEAT_FILE)
+
+def save_heartbeats(data):
+    save_json(HEARTBEAT_FILE, data)
+
+def load_last_read():
+    return load_json(LAST_READ_FILE)
+
+def save_last_read(data):
+    save_json(LAST_READ_FILE, data)
+
+def load_reports():
+    return load_json(REPORTS_FILE)
+
+def save_reports(data):
+    save_json(REPORTS_FILE, data)
+
+# ----- Эндпоинты (ваши, без изменений) -----
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
@@ -45,13 +216,10 @@ def register():
     if not user_id:
         return jsonify({'error': 'Missing user id'}), 400
 
-    existing = profiles.get(user_id)
+    existing = get_profile_data(user_id)
     if existing:
-        # Сохраняем админский статус и бан из существующего профиля
         data['is_admin'] = existing.get('is_admin', False)
         data['banned'] = existing.get('banned', False)
-        # Остальные поля (values, type_scores, dominant_type) берём из запроса,
-        # но если их нет – оставляем существующие (не трогаем)
         if 'values' not in data or data['values'] is None:
             data['values'] = existing.get('values', {})
         if 'type_scores' not in data or data['type_scores'] is None:
@@ -59,40 +227,28 @@ def register():
         if 'dominant_type' not in data or data['dominant_type'] is None:
             data['dominant_type'] = existing.get('dominant_type')
     else:
-        # Новый пользователь: по умолчанию не админ, не забанен
         data.setdefault('is_admin', False)
         data.setdefault('banned', False)
         data.setdefault('values', {})
         data.setdefault('type_scores', {})
         data.setdefault('dominant_type', None)
 
-    profiles[user_id] = data
-    save_profiles(profiles)
-    print(f"✅ Зарегистрирован {user_id} в {datetime.now()}")
+    save_profile_data(user_id, data)
+    print(f"✅ Зарегистрирован {user_id}")
     return jsonify({'status': 'ok'}), 200
 
 @app.route('/profiles', methods=['GET'])
 def get_profiles():
     exclude = request.args.get('exclude')
-    if exclude:
-        result = {uid: p for uid, p in profiles.items() if uid != exclude}
-    else:
-        result = profiles
+    result = get_all_profiles_exclude(exclude)
     return jsonify(result), 200
 
 @app.route('/profile/<user_id>', methods=['GET'])
 def get_profile(user_id):
-    profile = profiles.get(user_id)
+    profile = get_profile_data(user_id)
     if profile:
         return jsonify(profile), 200
     return jsonify({'error': 'Not found'}), 404
-
-# ========== СООБЩЕНИЯ ==========
-def load_messages():
-    return load_json(MESSAGES_FILE)
-
-def save_messages(data):
-    save_json(MESSAGES_FILE, data)
 
 @app.route('/send_message', methods=['POST'])
 def send_message():
@@ -102,18 +258,7 @@ def send_message():
     text = data.get('text')
     if not from_user or not to_user or not text:
         return jsonify({'error': 'Missing fields'}), 400
-    msg_db = load_messages()
-    msg_id = msg_db.get('next_id', 1)
-    msg = {
-        'id': msg_id,
-        'from': from_user,
-        'to': to_user,
-        'text': text,
-        'timestamp': datetime.now().isoformat()
-    }
-    msg_db.setdefault('messages', []).append(msg)
-    msg_db['next_id'] = msg_id + 1
-    save_messages(msg_db)
+    msg_id = save_message_db(from_user, to_user, text)
     print(f"📨 Сообщение {msg_id} от {from_user} к {to_user}: {text[:50]}")
     return jsonify({'status': 'ok', 'id': msg_id}), 200
 
@@ -123,8 +268,7 @@ def get_messages():
     last_id = request.args.get('last_id', default=0, type=int)
     if not user_id:
         return jsonify({'error': 'Missing user_id'}), 400
-    msg_db = load_messages()
-    new_msgs = [m for m in msg_db.get('messages', []) if m['to'] == user_id and m['id'] > last_id]
+    new_msgs = get_messages_for_user(user_id, last_id)
     return jsonify({'messages': new_msgs}), 200
 
 @app.route('/get_dialog', methods=['GET'])
@@ -134,19 +278,8 @@ def get_dialog():
     last_id = request.args.get('last_id', default=0, type=int)
     if not user1 or not user2:
         return jsonify({'error': 'Missing user1 or user2'}), 400
-    msg_db = load_messages()
-    dialog = [m for m in msg_db.get('messages', [])
-              if ((m['from'] == user1 and m['to'] == user2) or
-                  (m['from'] == user2 and m['to'] == user1))
-              and m['id'] > last_id]
+    dialog = get_dialog_db(user1, user2, last_id)
     return jsonify({'messages': dialog}), 200
-
-# ========== ОНЛАЙН ==========
-def load_heartbeats():
-    return load_json(HEARTBEAT_FILE)
-
-def save_heartbeats(data):
-    save_json(HEARTBEAT_FILE, data)
 
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
@@ -164,13 +297,6 @@ def online():
     now = time.time()
     online_users = [uid for uid, ts in hb.items() if now - ts < 30]
     return jsonify(online_users), 200
-
-# ========== НЕПРОЧИТАННЫЕ ==========
-def load_last_read():
-    return load_json(LAST_READ_FILE)
-
-def save_last_read(data):
-    save_json(LAST_READ_FILE, data)
 
 @app.route('/mark_read', methods=['POST'])
 def mark_read():
@@ -190,19 +316,26 @@ def unread():
     user_id = request.args.get('user_id')
     if not user_id:
         return jsonify({'error': 'Missing user_id'}), 400
-    msg_db = load_messages()
     lr = load_last_read()
     user_last_read = lr.get(user_id, {})
     unread_counts = {}
-    for msg in msg_db.get('messages', []):
-        if msg['to'] == user_id:
-            from_user = msg['from']
+    if USE_DB:
+        all_msgs = Message.query.filter(Message.to_user == user_id).all()
+        for msg in all_msgs:
+            from_user = msg.from_user
             last_read_id = user_last_read.get(from_user, 0)
-            if msg['id'] > last_read_id:
+            if msg.id > last_read_id:
                 unread_counts[from_user] = unread_counts.get(from_user, 0) + 1
+    else:
+        msg_db = load_json(MESSAGES_FILE)
+        for msg in msg_db.get('messages', []):
+            if msg['to'] == user_id:
+                from_user = msg['from']
+                last_read_id = user_last_read.get(from_user, 0)
+                if msg['id'] > last_read_id:
+                    unread_counts[from_user] = unread_counts.get(from_user, 0) + 1
     return jsonify(unread_counts), 200
 
-# ========== АДМИНИСТРИРОВАНИЕ ==========
 @app.route('/ban_user', methods=['POST'])
 def ban_user():
     data = request.json
@@ -212,10 +345,11 @@ def ban_user():
         return jsonify({'error': 'Missing admin_id or user_id'}), 400
     if not is_admin(admin_id):
         return jsonify({'error': 'Forbidden'}), 403
-    if user_id not in profiles:
+    profile = get_profile_data(user_id)
+    if profile is None:
         return jsonify({'error': 'User not found'}), 404
-    profiles[user_id]['banned'] = True
-    save_profiles(profiles)
+    profile['banned'] = True
+    save_profile_data(user_id, profile)
     print(f"🚫 Пользователь {user_id} заблокирован администратором {admin_id}")
     return jsonify({'status': 'ok'}), 200
 
@@ -228,34 +362,9 @@ def delete_user():
         return jsonify({'error': 'Missing admin_id or user_id'}), 400
     if not is_admin(admin_id):
         return jsonify({'error': 'Forbidden'}), 403
-    if user_id not in profiles:
-        return jsonify({'error': 'User not found'}), 404
-    # Удаляем профиль
-    del profiles[user_id]
-    save_profiles(profiles)
-    # Удаляем сообщения
-    msg_db = load_messages()
-    msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != user_id]
-    save_messages(msg_db)
-    # Удаляем heartbeat
-    hb = load_heartbeats()
-    if user_id in hb:
-        del hb[user_id]
-    save_heartbeats(hb)
-    # Удаляем last_read
-    lr = load_last_read()
-    if user_id in lr:
-        del lr[user_id]
-    save_last_read(lr)
+    delete_user_completely(user_id)
     print(f"🗑 Пользователь {user_id} удалён администратором {admin_id}")
     return jsonify({'status': 'ok'}), 200
-
-# ========== ЖАЛОБЫ ==========
-def load_reports():
-    return load_json(REPORTS_FILE)
-
-def save_reports(data):
-    save_json(REPORTS_FILE, data)
 
 @app.route('/report_message', methods=['POST'])
 def report_message():
@@ -309,26 +418,32 @@ def resolve_report():
     print(f"✅ Жалоба {report_id} отмечена как решённая админом {admin_id}")
     return jsonify({'status': 'ok'}), 200
 
-# ========== СТАТИСТИКА ==========
 @app.route('/stats', methods=['GET'])
 def stats():
     admin_id = request.args.get('admin_id')
     if not admin_id or not is_admin(admin_id):
         return jsonify({'error': 'Forbidden'}), 403
-    profiles_db = load_profiles()
-    msg_db = load_messages()
-    hb = load_heartbeats()
     now = time.time()
-    total_users = len(profiles_db)
-    total_messages = len(msg_db.get('messages', []))
+    hb = load_heartbeats()
     online_now = sum(1 for ts in hb.values() if now - ts < 30)
-    # Новые пользователи за последние 7 дней
-    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
-    new_users_week = 0
-    for p in profiles_db.values():
-        completed = p.get('completed_at')
-        if completed and completed > week_ago:
-            new_users_week += 1
+
+    if USE_DB:
+        total_users = Profile.query.count()
+        total_messages = Message.query.count()
+        week_ago = datetime.utcnow() - timedelta(days=7)
+        new_users_week = Profile.query.filter(Profile.updated_at > week_ago).count()
+    else:
+        profiles_db = load_json(PROFILES_FILE)
+        msg_db = load_json(MESSAGES_FILE)
+        total_users = len(profiles_db)
+        total_messages = len(msg_db.get('messages', []))
+        week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+        new_users_week = 0
+        for p in profiles_db.values():
+            completed = p.get('completed_at')
+            if completed and completed > week_ago:
+                new_users_week += 1
+
     return jsonify({
         'total_users': total_users,
         'total_messages': total_messages,
@@ -336,5 +451,7 @@ def stats():
         'online_now': online_now,
     }), 200
 
+# ----- Запуск -----
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
