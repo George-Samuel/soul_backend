@@ -4,6 +4,10 @@ import time
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, func
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.dialects.postgresql import JSONB
 
 app = Flask(__name__)
 CORS(app)
@@ -13,46 +17,38 @@ CORS(app)
 def home():
     return jsonify({'status': 'ok', 'message': 'Soul Pair API is running'}), 200
 
-# ----- Определяем, использовать ли базу данных -----
+# ----- Конфигурация базы данных -----
 DATABASE_URL = os.environ.get('DATABASE_URL')
 USE_DB = DATABASE_URL is not None
 
 if USE_DB:
-    # Импортируем SQLAlchemy только если будем использовать БД
-    from flask_sqlalchemy import SQLAlchemy
-    app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
-    app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-        'pool_pre_ping': True,
-        'pool_recycle': 300,
-    }
-    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-    db = SQLAlchemy(app)
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
+    SessionLocal = sessionmaker(bind=engine)
+    Base = declarative_base()
 
-    class Profile(db.Model):
+    class Profile(Base):
         __tablename__ = 'profiles'
-        user_id = db.Column(db.String, primary_key=True)
-        data = db.Column(db.JSON, nullable=False)
-        updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+        user_id = Column(String, primary_key=True)
+        data = Column(JSONB, nullable=False)
+        updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    class Message(db.Model):
+    class Message(Base):
         __tablename__ = 'messages'
-        id = db.Column(db.Integer, primary_key=True)
-        from_user = db.Column(db.String, nullable=False)
-        to_user = db.Column(db.String, nullable=False)
-        text = db.Column(db.Text, nullable=False)
-        timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+        id = Column(Integer, primary_key=True, autoincrement=True)
+        from_user = Column(String, nullable=False)
+        to_user = Column(String, nullable=False)
+        text = Column(Text, nullable=False)
+        timestamp = Column(DateTime, default=datetime.utcnow)
 
-    with app.app_context():
-        db.create_all()
-    print("✅ Подключена база данных Neon.tech")
+    Base.metadata.create_all(bind=engine)
+    print("✅ Подключена база данных Neon.tech (чистый SQLAlchemy)")
 else:
     print("⚠️ DATABASE_URL не задана, работаем с JSON-файлами")
-    # Заглушки, чтобы в остальном коде не было ошибок
-    db = None
+    SessionLocal = None
     Profile = None
     Message = None
 
-# ----- Остальные настройки и функции (JSON, общие) -----
+# ----- Константы и вспомогательные функции для JSON -----
 PROFILES_FILE = 'profiles.json'
 MESSAGES_FILE = 'messages.json'
 HEARTBEAT_FILE = 'heartbeats.json'
@@ -69,25 +65,33 @@ def save_json(file, data):
     with open(file, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# ----- Универсальные функции работы с профилями -----
+# ----- Универсальные функции для работы с данными -----
 def get_profile_data(user_id):
     if USE_DB and Profile:
-        profile = Profile.query.get(user_id)
-        return profile.data if profile else None
+        session = SessionLocal()
+        try:
+            prof = session.query(Profile).filter_by(user_id=user_id).first()
+            return prof.data if prof else None
+        finally:
+            session.close()
     else:
         profiles = load_json(PROFILES_FILE)
         return profiles.get(user_id)
 
 def save_profile_data(user_id, data):
     if USE_DB and Profile:
-        profile = Profile.query.get(user_id)
-        if profile:
-            profile.data = data
-            profile.updated_at = datetime.utcnow()
-        else:
-            profile = Profile(user_id=user_id, data=data)
-            db.session.add(profile)
-        db.session.commit()
+        session = SessionLocal()
+        try:
+            prof = session.query(Profile).filter_by(user_id=user_id).first()
+            if prof:
+                prof.data = data
+                prof.updated_at = datetime.utcnow()
+            else:
+                prof = Profile(user_id=user_id, data=data)
+                session.add(prof)
+            session.commit()
+        finally:
+            session.close()
     else:
         profiles = load_json(PROFILES_FILE)
         profiles[user_id] = data
@@ -97,13 +101,16 @@ def is_admin(user_id):
     profile = get_profile_data(user_id)
     return profile is not None and profile.get('is_admin', False)
 
-# ----- Сообщения -----
 def save_message_db(from_user, to_user, text):
     if USE_DB and Message:
-        msg = Message(from_user=from_user, to_user=to_user, text=text)
-        db.session.add(msg)
-        db.session.commit()
-        return msg.id
+        session = SessionLocal()
+        try:
+            msg = Message(from_user=from_user, to_user=to_user, text=text)
+            session.add(msg)
+            session.commit()
+            return msg.id
+        finally:
+            session.close()
     else:
         msg_db = load_json(MESSAGES_FILE)
         msg_id = msg_db.get('next_id', 1)
@@ -121,17 +128,21 @@ def save_message_db(from_user, to_user, text):
 
 def get_dialog_db(user1, user2, last_id):
     if USE_DB and Message:
-        query = Message.query.filter(
-            ((Message.from_user == user1) & (Message.to_user == user2)) |
-            ((Message.from_user == user2) & (Message.to_user == user1))
-        ).filter(Message.id > last_id).order_by(Message.id.asc())
-        return [{
-            'id': m.id,
-            'from': m.from_user,
-            'to': m.to_user,
-            'text': m.text,
-            'timestamp': m.timestamp.isoformat()
-        } for m in query.all()]
+        session = SessionLocal()
+        try:
+            query = session.query(Message).filter(
+                ((Message.from_user == user1) & (Message.to_user == user2)) |
+                ((Message.from_user == user2) & (Message.to_user == user1))
+            ).filter(Message.id > last_id).order_by(Message.id.asc())
+            return [{
+                'id': m.id,
+                'from': m.from_user,
+                'to': m.to_user,
+                'text': m.text,
+                'timestamp': m.timestamp.isoformat()
+            } for m in query.all()]
+        finally:
+            session.close()
     else:
         msg_db = load_json(MESSAGES_FILE)
         return [m for m in msg_db.get('messages', [])
@@ -141,23 +152,30 @@ def get_dialog_db(user1, user2, last_id):
 
 def get_messages_for_user(user_id, last_id):
     if USE_DB and Message:
-        query = Message.query.filter(Message.to_user == user_id, Message.id > last_id)
-        return [{
-            'id': m.id,
-            'from': m.from_user,
-            'to': m.to_user,
-            'text': m.text,
-            'timestamp': m.timestamp.isoformat()
-        } for m in query.all()]
+        session = SessionLocal()
+        try:
+            query = session.query(Message).filter(Message.to_user == user_id, Message.id > last_id)
+            return [{
+                'id': m.id,
+                'from': m.from_user,
+                'to': m.to_user,
+                'text': m.text,
+                'timestamp': m.timestamp.isoformat()
+            } for m in query.all()]
+        finally:
+            session.close()
     else:
         msg_db = load_json(MESSAGES_FILE)
-        return [m for m in msg_db.get('messages', [])
-                if m['to'] == user_id and m['id'] > last_id]
+        return [m for m in msg_db.get('messages', []) if m['to'] == user_id and m['id'] > last_id]
 
 def get_all_profiles_exclude(exclude_user):
     if USE_DB and Profile:
-        all_profiles = Profile.query.all()
-        return {p.user_id: p.data for p in all_profiles if p.user_id != exclude_user}
+        session = SessionLocal()
+        try:
+            all_profiles = session.query(Profile).all()
+            return {p.user_id: p.data for p in all_profiles if p.user_id != exclude_user}
+        finally:
+            session.close()
     else:
         profiles = load_json(PROFILES_FILE)
         if exclude_user:
@@ -166,20 +184,26 @@ def get_all_profiles_exclude(exclude_user):
 
 def delete_user_completely(user_id):
     if USE_DB and Profile and Message:
-        profile = Profile.query.get(user_id)
-        if profile:
-            db.session.delete(profile)
-        Message.query.filter((Message.from_user == user_id) | (Message.to_user == user_id)).delete()
-        db.session.commit()
+        session = SessionLocal()
+        try:
+            prof = session.query(Profile).filter_by(user_id=user_id).first()
+            if prof:
+                session.delete(prof)
+            session.query(Message).filter((Message.from_user == user_id) | (Message.to_user == 
+user_id)).delete()
+            session.commit()
+        finally:
+            session.close()
     else:
         profiles = load_json(PROFILES_FILE)
         if user_id in profiles:
             del profiles[user_id]
             save_json(PROFILES_FILE, profiles)
         msg_db = load_json(MESSAGES_FILE)
-        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != user_id]
+        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] 
+!= user_id]
         save_json(MESSAGES_FILE, msg_db)
-    # удалить также из heartbeat, last_read
+    # also remove from heartbeat, last_read
     hb = load_heartbeats()
     if user_id in hb:
         del hb[user_id]
@@ -189,7 +213,7 @@ def delete_user_completely(user_id):
         del lr[user_id]
     save_last_read(lr)
 
-# ----- Heartbeat, last_read (остаются на JSON) -----
+# ----- Heartbeat, last_read, reports (остаются на JSON) -----
 def load_heartbeats():
     return load_json(HEARTBEAT_FILE)
 
@@ -208,7 +232,7 @@ def load_reports():
 def save_reports(data):
     save_json(REPORTS_FILE, data)
 
-# ----- Эндпоинты (ваши, без изменений) -----
+# ----- Эндпоинты (оригинальные, но адаптированные) -----
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
@@ -320,12 +344,16 @@ def unread():
     user_last_read = lr.get(user_id, {})
     unread_counts = {}
     if USE_DB:
-        all_msgs = Message.query.filter(Message.to_user == user_id).all()
-        for msg in all_msgs:
-            from_user = msg.from_user
-            last_read_id = user_last_read.get(from_user, 0)
-            if msg.id > last_read_id:
-                unread_counts[from_user] = unread_counts.get(from_user, 0) + 1
+        session = SessionLocal()
+        try:
+            all_msgs = session.query(Message).filter(Message.to_user == user_id).all()
+            for msg in all_msgs:
+                from_user = msg.from_user
+                last_read_id = user_last_read.get(from_user, 0)
+                if msg.id > last_read_id:
+                    unread_counts[from_user] = unread_counts.get(from_user, 0) + 1
+        finally:
+            session.close()
     else:
         msg_db = load_json(MESSAGES_FILE)
         for msg in msg_db.get('messages', []):
@@ -428,10 +456,14 @@ def stats():
     online_now = sum(1 for ts in hb.values() if now - ts < 30)
 
     if USE_DB:
-        total_users = Profile.query.count()
-        total_messages = Message.query.count()
-        week_ago = datetime.utcnow() - timedelta(days=7)
-        new_users_week = Profile.query.filter(Profile.updated_at > week_ago).count()
+        session = SessionLocal()
+        try:
+            total_users = session.query(Profile).count()
+            total_messages = session.query(Message).count()
+            week_ago = datetime.utcnow() - timedelta(days=7)
+            new_users_week = session.query(Profile).filter(Profile.updated_at > week_ago).count()
+        finally:
+            session.close()
     else:
         profiles_db = load_json(PROFILES_FILE)
         msg_db = load_json(MESSAGES_FILE)
