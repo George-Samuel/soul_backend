@@ -8,16 +8,17 @@ from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, f
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import JSONB
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 CORS(app)
 
-# ----- Healthcheck -----
+# ========== HEALTHCHECK ==========
 @app.route('/')
 def home():
     return jsonify({'status': 'ok', 'message': 'Soul Pair API is running'}), 200
 
-# ----- Конфигурация базы данных -----
+# ========== ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ==========
 DATABASE_URL = os.environ.get('DATABASE_URL')
 USE_DB = DATABASE_URL is not None
 
@@ -48,7 +49,7 @@ else:
     Profile = None
     Message = None
 
-# ----- Константы и вспомогательные функции для JSON -----
+# ========== ОБЩИЕ НАСТРОЙКИ ДЛЯ JSON ==========
 PROFILES_FILE = 'profiles.json'
 MESSAGES_FILE = 'messages.json'
 HEARTBEAT_FILE = 'heartbeats.json'
@@ -65,7 +66,7 @@ def save_json(file, data):
     with open(file, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# ----- Универсальные функции для работы с данными -----
+# ========== УНИВЕРСАЛЬНЫЕ ФУНКЦИИ ДЛЯ ПРОФИЛЕЙ ==========
 def get_profile_data(user_id):
     if USE_DB and Profile:
         session = SessionLocal()
@@ -90,6 +91,9 @@ def save_profile_data(user_id, data):
                 prof = Profile(user_id=user_id, data=data)
                 session.add(prof)
             session.commit()
+        except Exception as e:
+            print(f"❌ Ошибка сохранения профиля: {e}")
+            session.rollback()
         finally:
             session.close()
     else:
@@ -101,6 +105,7 @@ def is_admin(user_id):
     profile = get_profile_data(user_id)
     return profile is not None and profile.get('is_admin', False)
 
+# ========== УНИВЕРСАЛЬНЫЕ ФУНКЦИИ ДЛЯ СООБЩЕНИЙ ==========
 def save_message_db(from_user, to_user, text):
     if USE_DB and Message:
         session = SessionLocal()
@@ -173,13 +178,20 @@ def get_all_profiles_exclude(exclude_user):
         session = SessionLocal()
         try:
             all_profiles = session.query(Profile).all()
-            return {p.user_id: p.data for p in all_profiles if p.user_id != exclude_user}
+            result = {p.user_id: p.data for p in all_profiles if p.user_id != exclude_user}
+            for uid in result:
+                if 'password_hash' in result[uid]:
+                    del result[uid]['password_hash']
+            return result
         finally:
             session.close()
     else:
         profiles = load_json(PROFILES_FILE)
         if exclude_user:
-            return {uid: p for uid, p in profiles.items() if uid != exclude_user}
+            profiles = {uid: p for uid, p in profiles.items() if uid != exclude_user}
+        for uid in profiles:
+            if 'password_hash' in profiles[uid]:
+                del profiles[uid]['password_hash']
         return profiles
 
 def delete_user_completely(user_id):
@@ -189,8 +201,7 @@ def delete_user_completely(user_id):
             prof = session.query(Profile).filter_by(user_id=user_id).first()
             if prof:
                 session.delete(prof)
-            session.query(Message).filter((Message.from_user == user_id) | (Message.to_user == 
-user_id)).delete()
+            session.query(Message).filter((Message.from_user == user_id) | (Message.to_user == user_id)).delete()
             session.commit()
         finally:
             session.close()
@@ -200,10 +211,9 @@ user_id)).delete()
             del profiles[user_id]
             save_json(PROFILES_FILE, profiles)
         msg_db = load_json(MESSAGES_FILE)
-        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] 
-!= user_id]
+        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != user_id]
         save_json(MESSAGES_FILE, msg_db)
-    # also remove from heartbeat, last_read
+    # remove from heartbeat, last_read
     hb = load_heartbeats()
     if user_id in hb:
         del hb[user_id]
@@ -213,7 +223,7 @@ user_id)).delete()
         del lr[user_id]
     save_last_read(lr)
 
-# ----- Heartbeat, last_read, reports (остаются на JSON) -----
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ JSON (HEARTBEAT, LAST_READ, REPORTS) ==========
 def load_heartbeats():
     return load_json(HEARTBEAT_FILE)
 
@@ -226,41 +236,70 @@ def load_last_read():
 def save_last_read(data):
     save_json(LAST_READ_FILE, data)
 
+def load_messages():
+    return load_json(MESSAGES_FILE)
+
+def save_messages(data):
+    save_json(MESSAGES_FILE, data)
+
 def load_reports():
     return load_json(REPORTS_FILE)
 
 def save_reports(data):
     save_json(REPORTS_FILE, data)
 
-# ----- Эндпоинты (оригинальные, но адаптированные) -----
+# ========== ЭНДПОИНТЫ ==========
+
+# ----- РЕГИСТРАЦИЯ (с паролем) -----
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
     user_id = data.get('id')
+    password = data.get('password')
     if not user_id:
         return jsonify({'error': 'Missing user id'}), 400
+    if not password or len(password) < 6:
+        return jsonify({'error': 'Password must be at least 6 characters'}), 400
 
     existing = get_profile_data(user_id)
     if existing:
-        data['is_admin'] = existing.get('is_admin', False)
-        data['banned'] = existing.get('banned', False)
-        if 'values' not in data or data['values'] is None:
-            data['values'] = existing.get('values', {})
-        if 'type_scores' not in data or data['type_scores'] is None:
-            data['type_scores'] = existing.get('type_scores', {})
-        if 'dominant_type' not in data or data['dominant_type'] is None:
-            data['dominant_type'] = existing.get('dominant_type')
-    else:
-        data.setdefault('is_admin', False)
-        data.setdefault('banned', False)
-        data.setdefault('values', {})
-        data.setdefault('type_scores', {})
-        data.setdefault('dominant_type', None)
+        return jsonify({'error': 'User already exists'}), 409
+
+    password_hash = generate_password_hash(password)
+    data['password_hash'] = password_hash
+    data.setdefault('is_admin', False)
+    data.setdefault('banned', False)
+    data.setdefault('values', {})
+    data.setdefault('type_scores', {})
+    data.setdefault('dominant_type', None)
 
     save_profile_data(user_id, data)
     print(f"✅ Зарегистрирован {user_id}")
     return jsonify({'status': 'ok'}), 200
 
+# ----- ЛОГИН -----
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    user_id = data.get('id')
+    password = data.get('password')
+    if not user_id or not password:
+        return jsonify({'error': 'Missing id or password'}), 400
+
+    profile = get_profile_data(user_id)
+    if not profile:
+        return jsonify({'error': 'User not found'}), 404
+
+    stored_hash = profile.get('password_hash')
+    if not stored_hash:
+        return jsonify({'error': 'Account not secured. Please re-register.'}), 401
+
+    if not check_password_hash(stored_hash, password):
+        return jsonify({'error': 'Invalid password'}), 401
+
+    return jsonify({'status': 'ok', 'user_id': user_id}), 200
+
+# ----- ПРОФИЛИ -----
 @app.route('/profiles', methods=['GET'])
 def get_profiles():
     exclude = request.args.get('exclude')
@@ -271,9 +310,13 @@ def get_profiles():
 def get_profile(user_id):
     profile = get_profile_data(user_id)
     if profile:
+        if 'password_hash' in profile:
+            profile = profile.copy()
+            del profile['password_hash']
         return jsonify(profile), 200
     return jsonify({'error': 'Not found'}), 404
 
+# ----- СООБЩЕНИЯ -----
 @app.route('/send_message', methods=['POST'])
 def send_message():
     data = request.json
@@ -305,6 +348,7 @@ def get_dialog():
     dialog = get_dialog_db(user1, user2, last_id)
     return jsonify({'messages': dialog}), 200
 
+# ----- ОНЛАЙН -----
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
     user_id = request.json.get('user_id')
@@ -322,6 +366,7 @@ def online():
     online_users = [uid for uid, ts in hb.items() if now - ts < 30]
     return jsonify(online_users), 200
 
+# ----- НЕПРОЧИТАННЫЕ -----
 @app.route('/mark_read', methods=['POST'])
 def mark_read():
     data = request.json
@@ -364,6 +409,7 @@ def unread():
                     unread_counts[from_user] = unread_counts.get(from_user, 0) + 1
     return jsonify(unread_counts), 200
 
+# ----- АДМИНИСТРИРОВАНИЕ -----
 @app.route('/ban_user', methods=['POST'])
 def ban_user():
     data = request.json
@@ -394,6 +440,7 @@ def delete_user():
     print(f"🗑 Пользователь {user_id} удалён администратором {admin_id}")
     return jsonify({'status': 'ok'}), 200
 
+# ----- ЖАЛОБЫ -----
 @app.route('/report_message', methods=['POST'])
 def report_message():
     data = request.json
@@ -446,6 +493,7 @@ def resolve_report():
     print(f"✅ Жалоба {report_id} отмечена как решённая админом {admin_id}")
     return jsonify({'status': 'ok'}), 200
 
+# ----- СТАТИСТИКА -----
 @app.route('/stats', methods=['GET'])
 def stats():
     admin_id = request.args.get('admin_id')
@@ -483,7 +531,7 @@ def stats():
         'online_now': online_now,
     }), 200
 
-# ----- Запуск -----
+# ----- ЗАПУСК -----
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
