@@ -10,6 +10,15 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import JSONB
 from werkzeug.security import generate_password_hash, check_password_hash
 
+# Пытаемся импортировать Google Auth, если не получилось – флаг False
+try:
+    from google.oauth2 import id_token
+    from google.auth.transport import requests as google_requests
+    GOOGLE_AUTH_AVAILABLE = True
+except ImportError:
+    GOOGLE_AUTH_AVAILABLE = False
+    print("⚠️ Google Auth не установлен, эндпоинт /auth/google будет недоступен")
+
 app = Flask(__name__)
 CORS(app)
 
@@ -42,7 +51,7 @@ if USE_DB:
         timestamp = Column(DateTime, default=datetime.utcnow)
 
     Base.metadata.create_all(bind=engine)
-    print("✅ Подключена база данных Neon.tech (чистый SQLAlchemy)")
+    print("✅ Подключена база данных Neon.tech")
 else:
     print("⚠️ DATABASE_URL не задана, работаем с JSON-файлами")
     SessionLocal = None
@@ -65,6 +74,24 @@ def load_json(file):
 def save_json(file, data):
     with open(file, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_heartbeats():
+    return load_json(HEARTBEAT_FILE)
+
+def save_heartbeats(data):
+    save_json(HEARTBEAT_FILE, data)
+
+def load_last_read():
+    return load_json(LAST_READ_FILE)
+
+def save_last_read(data):
+    save_json(LAST_READ_FILE, data)
+
+def load_reports():
+    return load_json(REPORTS_FILE)
+
+def save_reports(data):
+    save_json(REPORTS_FILE, data)
 
 # ----- Универсальные функции для работы с данными -----
 def get_profile_data(user_id):
@@ -212,7 +239,6 @@ def delete_user_completely(user_id):
         msg_db = load_json(MESSAGES_FILE)
         msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != user_id]
         save_json(MESSAGES_FILE, msg_db)
-    # also remove from heartbeat, last_read
     hb = load_heartbeats()
     if user_id in hb:
         del hb[user_id]
@@ -222,47 +248,25 @@ def delete_user_completely(user_id):
         del lr[user_id]
     save_last_read(lr)
 
-# ----- Heartbeat, last_read, reports (остаются на JSON) -----
-def load_heartbeats():
-    return load_json(HEARTBEAT_FILE)
-
-def save_heartbeats(data):
-    save_json(HEARTBEAT_FILE, data)
-
-def load_last_read():
-    return load_json(LAST_READ_FILE)
-
-def save_last_read(data):
-    save_json(LAST_READ_FILE, data)
-
-def load_reports():
-    return load_json(REPORTS_FILE)
-
-def save_reports(data):
-    save_json(REPORTS_FILE, data)
-
 # ----- ЭНДПОИНТЫ -----
+
+# Регистрация (с паролем)
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
     user_id = data.get('id')
     if not user_id:
         return jsonify({'error': 'Missing user id'}), 400
-
     existing = get_profile_data(user_id)
-    # Обработка пароля
     password = data.get('password')
     if existing:
-        # При обновлении профиля пароль не обязателен
         if password:
             if len(password) < 6:
                 return jsonify({'error': 'Password must be at least 6 characters'}), 400
             password_hash = generate_password_hash(password)
             data['password_hash'] = password_hash
-        # Сохраняем is_admin и banned из существующего профиля
         data['is_admin'] = existing.get('is_admin', False)
         data['banned'] = existing.get('banned', False)
-        # Остальные поля берём из запроса (если их нет – оставляем старые)
         if 'values' not in data or data['values'] is None:
             data['values'] = existing.get('values', {})
         if 'type_scores' not in data or data['type_scores'] is None:
@@ -270,7 +274,6 @@ def register():
         if 'dominant_type' not in data or data['dominant_type'] is None:
             data['dominant_type'] = existing.get('dominant_type')
     else:
-        # Новый пользователь: пароль обязателен
         if not password or len(password) < 6:
             return jsonify({'error': 'Password must be at least 6 characters'}), 400
         password_hash = generate_password_hash(password)
@@ -280,11 +283,11 @@ def register():
         data.setdefault('values', {})
         data.setdefault('type_scores', {})
         data.setdefault('dominant_type', None)
-
     save_profile_data(user_id, data)
     print(f"✅ Зарегистрирован {user_id}")
     return jsonify({'status': 'ok'}), 200
 
+# Логин по email+пароль
 @app.route('/login', methods=['POST'])
 def login():
     data = request.json
@@ -292,29 +295,66 @@ def login():
     password = data.get('password')
     if not user_id or not password:
         return jsonify({'error': 'Missing id or password'}), 400
-
     profile = get_profile_data(user_id)
     if not profile:
         return jsonify({'error': 'User not found'}), 404
-
     stored_hash = profile.get('password_hash')
     if not stored_hash:
         return jsonify({'error': 'Account not secured. Please re-register.'}), 401
-
     if not check_password_hash(stored_hash, password):
         return jsonify({'error': 'Invalid password'}), 401
-
     return jsonify({'status': 'ok', 'user_id': user_id}), 200
 
-# ----- ОСТАЛЬНЫЕ ЭНДПОИНТЫ (профили, сообщения, онлайн и т.д.) -----
-# (они такие же, как в вашей рабочей версии, я их не меняю)
-# Для экономии места я не копирую их сюда, но в вашем файле они должны быть.
-# Пожалуйста, добавьте свои рабочие эндпоинты: /profiles, /profile/<id>, /send_message, /get_dialog,
-# /heartbeat, /online, /mark_read, /unread, /ban_user, /delete_user, /report_message, /get_reports,
-# /resolve_report, /stats.
-# Ниже я приведу только заглушку, чтобы файл был синтаксически правильным, но вы вставьте свой реальный код.
+# Вход через Google
+@app.route('/auth/google', methods=['POST'])
+def google_auth():
+    if not GOOGLE_AUTH_AVAILABLE:
+        return jsonify({'error': 'Google auth not configured on this server'}), 501
+    token = request.json.get('idToken')
+    if not token:
+        return jsonify({'error': 'Missing token'}), 400
 
-# ПРОФИЛИ
+    # Замените 'YOUR_WEB_CLIENT_ID' на ваш Web Client ID из Google Cloud Console
+    CLIENT_ID = '622081870065-0lupcki5uufgo0kjln4f7l87dknmeu72.apps.googleusercontent.com'
+    try:
+        info = id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
+        if info is None:
+            return jsonify({'error': 'Invalid token'}), 401
+
+        email = info['email']
+        name = info.get('name', '')
+        picture = info.get('picture', '')
+        user_id = email.replace('@', '_at_').replace('.', '_dot_')
+
+        profile = get_profile_data(user_id)
+        if not profile:
+            profile = {
+                'id': user_id,
+                'email': email,
+                'name': name,
+                'selected_avatar': picture,
+                'is_admin': False,
+                'banned': False,
+                'values': {},
+                'type_scores': {},
+                'dominant_type': None,
+                'completed_at': datetime.now().isoformat(),
+            }
+            save_profile_data(user_id, profile)
+        else:
+            if name and name != profile.get('name'):
+                profile['name'] = name
+            if picture and picture != profile.get('selected_avatar'):
+                profile['selected_avatar'] = picture
+            save_profile_data(user_id, profile)
+
+        return jsonify({'status': 'ok', 'user_id': user_id}), 200
+
+    except Exception as e:
+        print(f'Google auth error: {e}')
+        return jsonify({'error': 'Authentication failed'}), 500
+
+# Профили
 @app.route('/profiles', methods=['GET'])
 def get_profiles():
     exclude = request.args.get('exclude')
@@ -331,7 +371,7 @@ def get_profile(user_id):
         return jsonify(profile), 200
     return jsonify({'error': 'Not found'}), 404
 
-# СООБЩЕНИЯ
+# Сообщения
 @app.route('/send_message', methods=['POST'])
 def send_message():
     data = request.json
@@ -363,7 +403,7 @@ def get_dialog():
     dialog = get_dialog_db(user1, user2, last_id)
     return jsonify({'messages': dialog}), 200
 
-# ОНЛАЙН
+# Онлайн
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
     user_id = request.json.get('user_id')
@@ -381,7 +421,7 @@ def online():
     online_users = [uid for uid, ts in hb.items() if now - ts < 30]
     return jsonify(online_users), 200
 
-# НЕПРОЧИТАННЫЕ
+# Непрочитанные
 @app.route('/mark_read', methods=['POST'])
 def mark_read():
     data = request.json
@@ -424,7 +464,7 @@ def unread():
                     unread_counts[from_user] = unread_counts.get(from_user, 0) + 1
     return jsonify(unread_counts), 200
 
-# АДМИНИСТРИРОВАНИЕ (сокращённо, но рабочее)
+# Администрирование
 @app.route('/ban_user', methods=['POST'])
 def ban_user():
     data = request.json
@@ -455,6 +495,7 @@ def delete_user():
     print(f"🗑 Пользователь {user_id} удалён администратором {admin_id}")
     return jsonify({'status': 'ok'}), 200
 
+# Жалобы
 @app.route('/report_message', methods=['POST'])
 def report_message():
     data = request.json
@@ -507,6 +548,7 @@ def resolve_report():
     print(f"✅ Жалоба {report_id} отмечена как решённая админом {admin_id}")
     return jsonify({'status': 'ok'}), 200
 
+# Статистика
 @app.route('/stats', methods=['GET'])
 def stats():
     admin_id = request.args.get('admin_id')
