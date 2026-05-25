@@ -315,7 +315,7 @@ def google_auth():
         return jsonify({'error': 'Missing token'}), 400
 
     # Замените 'YOUR_WEB_CLIENT_ID' на ваш Web Client ID из Google Cloud Console
-    CLIENT_ID = '451981090613-avp94q90nifo0s6s0kn8k9h9qf094qqf.apps.googleusercontent.com'
+    CLIENT_ID = '69193608569-lljeikos3ttitkug6vg05dn43mshsivq.apps.googleusercontent.com'
     try:
         info = id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
         if info is None:
