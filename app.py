@@ -1,16 +1,18 @@
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import JSONB
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 
-# Пытаемся импортировать Google Auth, если не получилось – флаг False
+# ---- Google Auth (опционально, для Render) ----
 try:
     from google.oauth2 import id_token
     from google.auth.transport import requests as google_requests
@@ -64,6 +66,14 @@ MESSAGES_FILE = 'messages.json'
 HEARTBEAT_FILE = 'heartbeats.json'
 LAST_READ_FILE = 'last_read.json'
 REPORTS_FILE = 'reports.json'
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def load_json(file):
     if os.path.exists(file):
@@ -305,7 +315,7 @@ def login():
         return jsonify({'error': 'Invalid password'}), 401
     return jsonify({'status': 'ok', 'user_id': user_id}), 200
 
-# Вход через Google
+# Вход через Google (только если библиотека установлена)
 @app.route('/auth/google', methods=['POST'])
 def google_auth():
     if not GOOGLE_AUTH_AVAILABLE:
@@ -313,19 +323,15 @@ def google_auth():
     token = request.json.get('idToken')
     if not token:
         return jsonify({'error': 'Missing token'}), 400
-
-    # Замените 'YOUR_WEB_CLIENT_ID' на ваш Web Client ID из Google Cloud Console
     CLIENT_ID = '69193608569-lljeikos3ttitkug6vg05dn43mshsivq.apps.googleusercontent.com'
     try:
         info = id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
         if info is None:
             return jsonify({'error': 'Invalid token'}), 401
-
         email = info['email']
         name = info.get('name', '')
         picture = info.get('picture', '')
-        user_id = email.replace('@', '_at_').replace('.', '_dot_')
-
+        user_id = email.replaceAll('@', '_at_').replaceAll('.', '_dot_')
         profile = get_profile_data(user_id)
         if not profile:
             profile = {
@@ -347,9 +353,7 @@ def google_auth():
             if picture and picture != profile.get('selected_avatar'):
                 profile['selected_avatar'] = picture
             save_profile_data(user_id, profile)
-
         return jsonify({'status': 'ok', 'user_id': user_id}), 200
-
     except Exception as e:
         print(f'Google auth error: {e}')
         return jsonify({'error': 'Authentication failed'}), 500
@@ -414,7 +418,7 @@ def heartbeat():
     save_heartbeats(hb)
     return jsonify({'status': 'ok'}), 200
 
-@app.route('/online', methods=['GET'])
+@app.route('/online', methods=['GET'])   # исправлено
 def online():
     hb = load_heartbeats()
     now = time.time()
@@ -586,7 +590,58 @@ def stats():
         'online_now': online_now,
     }), 200
 
-# ----- ЗАПУСК -----
+# ========== ДОБАВЛЕННЫЕ ЭНДПОИНТЫ ==========
+
+# Загрузка фото
+@app.route('/upload_photo', methods=['POST'])
+def upload_photo():
+    if 'photo' not in request.files:
+        return jsonify({'error': 'No photo'}), 400
+    file = request.files['photo']
+    if file.filename == '' or not allowed_file(file.filename):
+        return jsonify({'error': 'Invalid file'}), 400
+    filename = secure_filename(f"{uuid.uuid4()}_{file.filename}")
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+    photo_url = request.host_url + 'uploads/' + filename
+    return jsonify({'photo_url': photo_url}), 200
+
+# Раздача статики для загруженных фото
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+# Статус печати
+typing_status = {}
+
+@app.route('/typing', methods=['POST'])
+def typing():
+    data = request.json
+    from_user = data.get('from_user')
+    to_user = data.get('to_user')
+    typing = data.get('typing', False)
+    if not from_user or not to_user:
+        return jsonify({'error': 'Missing fields'}), 400
+    key = (from_user, to_user)
+    typing_status[key] = (time.time(), typing)
+    return jsonify({'status': 'ok'}), 200
+
+@app.route('/typing_status', methods=['GET'])
+def typing_status_get():
+    from_user = request.args.get('from_user')
+    to_user = request.args.get('to_user')
+    if not from_user or not to_user:
+        return jsonify({'error': 'Missing fields'}), 400
+    key = (to_user, from_user)  # смотрим, печатает ли собеседник нам
+    if key in typing_status:
+        ts, typing = typing_status[key]
+        if time.time() - ts < 3:
+            return jsonify({'typing': typing}), 200
+        else:
+            del typing_status[key]
+    return jsonify({'typing': False}), 200
+
+# ========== ЗАПУСК ==========
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
