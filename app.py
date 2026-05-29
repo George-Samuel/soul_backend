@@ -339,7 +339,7 @@ def google_auth():
         email = info['email']
         name = info.get('name', '')
         picture = info.get('picture', '')
-        user_id = email.replaceAll('@', '_at_').replaceAll('.', '_dot_')
+        user_id = email.replace('@', '_at_').replace('.', '_dot_')
         profile = get_profile_data(user_id)
         if not profile:
             profile = {
