@@ -12,7 +12,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
-# ---- Google Auth (опционально, для Render) ----
+# ---- Google Auth (опционально) ----
 try:
     from google.oauth2 import id_token
     from google.auth.transport import requests as google_requests
@@ -49,7 +49,8 @@ if USE_DB:
         id = Column(Integer, primary_key=True, autoincrement=True)
         from_user = Column(String, nullable=False)
         to_user = Column(String, nullable=False)
-        text = Column(Text, nullable=False)
+        text = Column(Text, nullable=True)
+        image_url = Column(Text, nullable=True)
         timestamp = Column(DateTime, default=datetime.utcnow)
 
     Base.metadata.create_all(bind=engine)
@@ -142,11 +143,12 @@ def is_admin(user_id):
     profile = get_profile_data(user_id)
     return profile is not None and profile.get('is_admin', False)
 
-def save_message_db(from_user, to_user, text):
+# ----- Работа с сообщениями (поддержка image_url) -----
+def save_message_db(from_user, to_user, text='', image_url=None):
     if USE_DB and Message:
         session = SessionLocal()
         try:
-            msg = Message(from_user=from_user, to_user=to_user, text=text)
+            msg = Message(from_user=from_user, to_user=to_user, text=text, image_url=image_url)
             session.add(msg)
             session.commit()
             return msg.id
@@ -160,8 +162,10 @@ def save_message_db(from_user, to_user, text):
             'from': from_user,
             'to': to_user,
             'text': text,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
         }
+        if image_url:
+            msg['image_url'] = image_url
         msg_db.setdefault('messages', []).append(msg)
         msg_db['next_id'] = msg_id + 1
         save_json(MESSAGES_FILE, msg_db)
@@ -179,7 +183,8 @@ def get_dialog_db(user1, user2, last_id):
                 'id': m.id,
                 'from': m.from_user,
                 'to': m.to_user,
-                'text': m.text,
+                'text': m.text or '',
+                'image_url': m.image_url,
                 'timestamp': m.timestamp.isoformat()
             } for m in query.all()]
         finally:
@@ -200,7 +205,8 @@ def get_messages_for_user(user_id, last_id):
                 'id': m.id,
                 'from': m.from_user,
                 'to': m.to_user,
-                'text': m.text,
+                'text': m.text or '',
+                'image_url': m.image_url,
                 'timestamp': m.timestamp.isoformat()
             } for m in query.all()]
         finally:
@@ -237,7 +243,8 @@ def delete_user_completely(user_id):
             prof = session.query(Profile).filter_by(user_id=user_id).first()
             if prof:
                 session.delete(prof)
-            session.query(Message).filter((Message.from_user == user_id) | (Message.to_user == user_id)).delete()
+            session.query(Message).filter((Message.from_user == user_id) | (Message.to_user == 
+user_id)).delete()
             session.commit()
         finally:
             session.close()
@@ -247,7 +254,8 @@ def delete_user_completely(user_id):
             del profiles[user_id]
             save_json(PROFILES_FILE, profiles)
         msg_db = load_json(MESSAGES_FILE)
-        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != user_id]
+        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != 
+user_id]
         save_json(MESSAGES_FILE, msg_db)
     hb = load_heartbeats()
     if user_id in hb:
@@ -315,7 +323,7 @@ def login():
         return jsonify({'error': 'Invalid password'}), 401
     return jsonify({'status': 'ok', 'user_id': user_id}), 200
 
-# Вход через Google (только если библиотека установлена)
+# Вход через Google
 @app.route('/auth/google', methods=['POST'])
 def google_auth():
     if not GOOGLE_AUTH_AVAILABLE:
@@ -375,16 +383,19 @@ def get_profile(user_id):
         return jsonify(profile), 200
     return jsonify({'error': 'Not found'}), 404
 
-# Сообщения
+# Сообщения (с поддержкой image_url)
 @app.route('/send_message', methods=['POST'])
 def send_message():
     data = request.json
     from_user = data.get('from')
     to_user = data.get('to')
-    text = data.get('text')
-    if not from_user or not to_user or not text:
-        return jsonify({'error': 'Missing fields'}), 400
-    msg_id = save_message_db(from_user, to_user, text)
+    text = data.get('text', '')
+    image_url = data.get('image_url')
+    if not from_user or not to_user:
+        return jsonify({'error': 'Missing from or to'}), 400
+    if not text and not image_url:
+        return jsonify({'error': 'No content'}), 400
+    msg_id = save_message_db(from_user, to_user, text, image_url)
     print(f"📨 Сообщение {msg_id} от {from_user} к {to_user}")
     return jsonify({'status': 'ok', 'id': msg_id}), 200
 
@@ -418,7 +429,7 @@ def heartbeat():
     save_heartbeats(hb)
     return jsonify({'status': 'ok'}), 200
 
-@app.route('/online', methods=['GET'])   # исправлено
+@app.route('/online', methods=['GET'])
 def online():
     hb = load_heartbeats()
     now = time.time()
@@ -590,7 +601,7 @@ def stats():
         'online_now': online_now,
     }), 200
 
-# ========== ДОБАВЛЕННЫЕ ЭНДПОИНТЫ ==========
+# ========== ДОБАВЛЕННЫЕ ЭНДПОИНТЫ ДЛЯ ФОТО И СТАТУСА ПЕЧАТИ ==========
 
 # Загрузка фото
 @app.route('/upload_photo', methods=['POST'])
@@ -632,7 +643,7 @@ def typing_status_get():
     to_user = request.args.get('to_user')
     if not from_user or not to_user:
         return jsonify({'error': 'Missing fields'}), 400
-    key = (to_user, from_user)  # смотрим, печатает ли собеседник нам
+    key = (to_user, from_user)
     if key in typing_status:
         ts, typing = typing_status[key]
         if time.time() - ts < 3:
