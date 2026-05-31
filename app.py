@@ -12,6 +12,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
+# ---- Cloudinary для хранения фото ----
+import cloudinary
+import cloudinary.uploader
+
 # ---- Google Auth (опционально) ----
 try:
     from google.oauth2 import id_token
@@ -23,6 +27,13 @@ except ImportError:
 
 app = Flask(__name__)
 CORS(app)
+
+# ----- Настройка Cloudinary (из переменных окружения) -----
+cloudinary.config(
+    cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME'),
+    api_key=os.environ.get('CLOUDINARY_API_KEY'),
+    api_secret=os.environ.get('CLOUDINARY_API_SECRET')
+)
 
 # ----- Healthcheck -----
 @app.route('/')
@@ -243,8 +254,7 @@ def delete_user_completely(user_id):
             prof = session.query(Profile).filter_by(user_id=user_id).first()
             if prof:
                 session.delete(prof)
-            session.query(Message).filter((Message.from_user == user_id) | (Message.to_user == 
-user_id)).delete()
+            session.query(Message).filter((Message.from_user == user_id) | (Message.to_user == user_id)).delete()
             session.commit()
         finally:
             session.close()
@@ -254,8 +264,7 @@ user_id)).delete()
             del profiles[user_id]
             save_json(PROFILES_FILE, profiles)
         msg_db = load_json(MESSAGES_FILE)
-        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != 
-user_id]
+        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != user_id]
         save_json(MESSAGES_FILE, msg_db)
     hb = load_heartbeats()
     if user_id in hb:
@@ -323,7 +332,7 @@ def login():
         return jsonify({'error': 'Invalid password'}), 401
     return jsonify({'status': 'ok', 'user_id': user_id}), 200
 
-# Вход через Google
+# Вход через Google (исправлен replaceAll -> replace)
 @app.route('/auth/google', methods=['POST'])
 def google_auth():
     if not GOOGLE_AUTH_AVAILABLE:
@@ -331,7 +340,7 @@ def google_auth():
     token = request.json.get('idToken')
     if not token:
         return jsonify({'error': 'Missing token'}), 400
-    CLIENT_ID = '69193608569-lljeikos3ttitkug6vg05dn43mshsivq.apps.googleusercontent.com'
+    CLIENT_ID = '69193608569-lljeikos3ttitkug6vg05dn43mshsivq.apps.googleusercontent.com'  # ЗАМЕНИ НА РЕАЛЬНЫЙ!
     try:
         info = id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
         if info is None:
@@ -339,6 +348,7 @@ def google_auth():
         email = info['email']
         name = info.get('name', '')
         picture = info.get('picture', '')
+        # ИСПРАВЛЕНО: replaceAll -> replace
         user_id = email.replace('@', '_at_').replace('.', '_dot_')
         profile = get_profile_data(user_id)
         if not profile:
@@ -601,9 +611,8 @@ def stats():
         'online_now': online_now,
     }), 200
 
-# ========== ДОБАВЛЕННЫЕ ЭНДПОИНТЫ ДЛЯ ФОТО И СТАТУСА ПЕЧАТИ ==========
+# ========== ОБНОВЛЁННЫЙ ЭНДПОИНТ ДЛЯ ФОТО (CLOUDINARY) ==========
 
-# Загрузка фото
 @app.route('/upload_photo', methods=['POST'])
 def upload_photo():
     if 'photo' not in request.files:
@@ -611,16 +620,18 @@ def upload_photo():
     file = request.files['photo']
     if file.filename == '' or not allowed_file(file.filename):
         return jsonify({'error': 'Invalid file'}), 400
-    filename = secure_filename(f"{uuid.uuid4()}_{file.filename}")
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    file.save(filepath)
-    photo_url = request.host_url + 'uploads/' + filename
-    return jsonify({'photo_url': photo_url}), 200
 
-# Раздача статики для загруженных фото
-@app.route('/uploads/<filename>')
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+    try:
+        # Загружаем фото в Cloudinary
+        upload_result = cloudinary.uploader.upload(file)
+        photo_url = upload_result['secure_url']  # HTTPS ссылка
+        return jsonify({'photo_url': photo_url}), 200
+    except Exception as e:
+        print(f"❌ Ошибка загрузки в Cloudinary: {e}")
+        return jsonify({'error': 'Failed to upload photo'}), 500
+
+# ========== СТАРЫЙ ЭНДПОИНТ /uploads/<filename> УДАЛЁН ==========
+# Больше не нужен, так как фото хранятся в облаке.
 
 # Статус печати
 typing_status = {}
