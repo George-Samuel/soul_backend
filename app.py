@@ -2,6 +2,7 @@ import json
 import os
 import time
 import uuid
+import re
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -348,7 +349,6 @@ def google_auth():
         email = info['email']
         name = info.get('name', '')
         picture = info.get('picture', '')
-        # ИСПРАВЛЕНО: replaceAll -> replace
         user_id = email.replace('@', '_at_').replace('.', '_dot_')
         profile = get_profile_data(user_id)
         if not profile:
@@ -611,6 +611,67 @@ def stats():
         'online_now': online_now,
     }), 200
 
+# ========== УДАЛЕНИЕ СООБЩЕНИЯ ==========
+
+@app.route('/delete_message', methods=['POST'])
+def delete_message():
+    data = request.json
+    user_id = data.get('user_id')
+    message_id = data.get('message_id')
+    
+    if not user_id or not message_id:
+        return jsonify({'error': 'Missing user_id or message_id'}), 400
+    
+    if USE_DB and Message:
+        session = SessionLocal()
+        try:
+            msg = session.query(Message).filter(Message.id == message_id).first()
+            if not msg:
+                return jsonify({'error': 'Message not found'}), 404
+            
+            if msg.from_user != user_id:
+                return jsonify({'error': 'You can only delete your own messages'}), 403
+            
+            # Если у сообщения есть фото — удаляем его из Cloudinary
+            if msg.image_url and 'cloudinary.com' in msg.image_url:
+                try:
+                    match = re.search(r'/upload/(?:v\d+/)?([^/.]+)(?:\.[^.]+)?$', msg.image_url)
+                    if match:
+                        public_id = match.group(1)
+                        cloudinary.uploader.destroy(public_id)
+                        print(f"🗑 Удалено фото из Cloudinary: {public_id}")
+                except Exception as e:
+                    print(f"⚠️ Ошибка удаления фото из Cloudinary: {e}")
+            
+            session.delete(msg)
+            session.commit()
+            print(f"🗑 Сообщение {message_id} удалено пользователем {user_id}")
+            return jsonify({'status': 'ok'}), 200
+            
+        except Exception as e:
+            session.rollback()
+            print(f"❌ Ошибка удаления сообщения: {e}")
+            return jsonify({'error': 'Internal server error'}), 500
+        finally:
+            session.close()
+    else:
+        msg_db = load_json(MESSAGES_FILE)
+        messages = msg_db.get('messages', [])
+        found = None
+        for i, m in enumerate(messages):
+            if m['id'] == message_id:
+                found = i
+                break
+        if found is None:
+            return jsonify({'error': 'Message not found'}), 404
+        msg = messages[found]
+        if msg['from'] != user_id:
+            return jsonify({'error': 'You can only delete your own messages'}), 403
+        del messages[found]
+        save_json(MESSAGES_FILE, msg_db)
+        print(f"🗑 Сообщение {message_id} удалено из JSON")
+        return jsonify({'status': 'ok'}), 200
+
 # ========== ОБНОВЛЁННЫЙ ЭНДПОИНТ ДЛЯ ФОТО (CLOUDINARY) ==========
 
 @app.route('/upload_photo', methods=['POST'])
@@ -622,46 +683,15 @@ def upload_photo():
         return jsonify({'error': 'Invalid file'}), 400
 
     try:
-        # Загружаем фото в Cloudinary
         upload_result = cloudinary.uploader.upload(file)
-        photo_url = upload_result['secure_url']  # HTTPS ссылка
+        photo_url = upload_result['secure_url']
         return jsonify({'photo_url': photo_url}), 200
     except Exception as e:
         print(f"❌ Ошибка загрузки в Cloudinary: {e}")
         return jsonify({'error': 'Failed to upload photo'}), 500
 
-# ========== СТАРЫЙ ЭНДПОИНТ /uploads/<filename> УДАЛЁН ==========
-# Больше не нужен, так как фото хранятся в облаке.
-
-# Статус печати
-typing_status = {}
-
-@app.route('/typing', methods=['POST'])
-def typing():
-    data = request.json
-    from_user = data.get('from_user')
-    to_user = data.get('to_user')
-    typing = data.get('typing', False)
-    if not from_user or not to_user:
-        return jsonify({'error': 'Missing fields'}), 400
-    key = (from_user, to_user)
-    typing_status[key] = (time.time(), typing)
-    return jsonify({'status': 'ok'}), 200
-
-@app.route('/typing_status', methods=['GET'])
-def typing_status_get():
-    from_user = request.args.get('from_user')
-    to_user = request.args.get('to_user')
-    if not from_user or not to_user:
-        return jsonify({'error': 'Missing fields'}), 400
-    key = (to_user, from_user)
-    if key in typing_status:
-        ts, typing = typing_status[key]
-        if time.time() - ts < 3:
-            return jsonify({'typing': typing}), 200
-        else:
-            del typing_status[key]
-    return jsonify({'typing': False}), 200
+# ========== ФУНКЦИОНАЛ "ПЕЧАТАЕТ" ПОЛНОСТЬЮ УДАЛЁН ==========
+# (раньше здесь были /typing и /typing_status)
 
 # ========== ЗАПУСК ==========
 if __name__ == '__main__':
