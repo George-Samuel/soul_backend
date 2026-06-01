@@ -3,6 +3,8 @@ import os
 import time
 import uuid
 import re
+import hmac
+import hashlib
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -29,7 +31,7 @@ except ImportError:
 app = Flask(__name__)
 CORS(app)
 
-# ----- Настройка Cloudinary (из переменных окружения) -----
+# ----- Настройка Cloudinary (основные ключи для загрузки/удаления) -----
 cloudinary.config(
     cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME'),
     api_key=os.environ.get('CLOUDINARY_API_KEY'),
@@ -341,7 +343,7 @@ def google_auth():
     token = request.json.get('idToken')
     if not token:
         return jsonify({'error': 'Missing token'}), 400
-    CLIENT_ID = '69193608569-lljeikos3ttitkug6vg05dn43mshsivq.apps.googleusercontent.com'  # ЗАМЕНИ НА РЕАЛЬНЫЙ!
+    CLIENT_ID = '69193608569-lljeikos3ttitkug6vg05dn43mshsivq.apps.googleusercontent.com'  # ЗАМЕНИТЕ НА РЕАЛЬНЫЙ
     try:
         info = id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
         if info is None:
@@ -612,7 +614,6 @@ def stats():
     }), 200
 
 # ========== УДАЛЕНИЕ СООБЩЕНИЯ ==========
-
 @app.route('/delete_message', methods=['POST'])
 def delete_message():
     data = request.json
@@ -655,6 +656,7 @@ def delete_message():
         finally:
             session.close()
     else:
+        # JSON режим (без БД)
         msg_db = load_json(MESSAGES_FILE)
         messages = msg_db.get('messages', [])
         found = None
@@ -672,7 +674,8 @@ def delete_message():
         print(f"🗑 Сообщение {message_id} удалено из JSON")
         return jsonify({'status': 'ok'}), 200
 
-# ========== ОБНОВЛЁННЫЙ ЭНДПОИНТ ДЛЯ ФОТО (CLOUDINARY) ==========
+# ========== ЗАГРУЗКА ФОТО С МОДЕРАЦИЕЙ ==========
+YOUR_WEBHOOK_URL = 'https://soul-backend-5pcj.onrender.com/webhook/moderation'
 
 @app.route('/upload_photo', methods=['POST'])
 def upload_photo():
@@ -683,15 +686,59 @@ def upload_photo():
         return jsonify({'error': 'Invalid file'}), 400
 
     try:
-        upload_result = cloudinary.uploader.upload(file)
+        upload_result = cloudinary.uploader.upload(
+            file,
+            upload_preset='soul_pair_moderation',
+            notification_url=YOUR_WEBHOOK_URL,
+            folder='soul_pair_users_photos'
+        )
         photo_url = upload_result['secure_url']
+        print(f"✅ Фото загружено на модерацию: {photo_url}")
         return jsonify({'photo_url': photo_url}), 200
     except Exception as e:
         print(f"❌ Ошибка загрузки в Cloudinary: {e}")
         return jsonify({'error': 'Failed to upload photo'}), 500
 
-# ========== ФУНКЦИОНАЛ "ПЕЧАТАЕТ" ПОЛНОСТЬЮ УДАЛЁН ==========
-# (раньше здесь были /typing и /typing_status)
+# ========== ВЕБХУК ДЛЯ МОДЕРАЦИИ ==========
+@app.route('/webhook/moderation', methods=['POST'])
+def moderation_webhook():
+    signature = request.headers.get('X-Cld-Signature')
+    timestamp = request.headers.get('X-Cld-Timestamp')
+    
+    if not signature or not timestamp:
+        print("🚨 Получен запрос без подписи. Отклоняем.")
+        return jsonify({'error': 'Missing signature'}), 401
+
+    # Используем специальный секрет для вебхуков, а не основной
+    webhook_secret = os.environ.get('bwYa2xJA9H915b0fjxkqM4XXKoA')
+    if not webhook_secret:
+        print("⚠️ CLOUDINARY_WEBHOOK_SECRET не задан, пропускаем проверку подписи")
+    else:
+        payload_body = request.get_data(as_text=True)
+        signed_payload = payload_body + timestamp
+        expected_signature = hmac.new(
+            key=webhook_secret.encode('utf-8'),
+            msg=signed_payload.encode('utf-8'),
+            digestmod=hashlib.sha1
+        ).hexdigest()
+        if not hmac.compare_digest(expected_signature, signature):
+            print("🚨 Неверная подпись вебхука")
+            return jsonify({'error': 'Invalid signature'}), 401
+
+    data = request.get_json()
+    try:
+        public_id = data['public_id']
+        moderation_status = data['moderation'][0]['status']  # 'approved' или 'rejected'
+        print(f"📸 Вердикт для {public_id}: {moderation_status}")
+
+        if moderation_status == 'rejected':
+            print(f"🚫 Фото {public_id} отклонено. Удаляем из Cloudinary...")
+            cloudinary.uploader.destroy(public_id)
+            # Здесь можно добавить логику для уведомления пользователя
+    except Exception as e:
+        print(f"❌ Ошибка обработки вебхука: {e}")
+
+    return jsonify({'status': 'ok'}), 200
 
 # ========== ЗАПУСК ==========
 if __name__ == '__main__':
