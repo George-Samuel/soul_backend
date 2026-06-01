@@ -710,7 +710,7 @@ def moderation_webhook():
         return jsonify({'error': 'Missing signature'}), 401
 
     # Используем специальный секрет для вебхуков, а не основной
-    webhook_secret = os.environ.get('bwYa2xJA9H915b0fjxkqM4XXKoA')
+    webhook_secret = os.environ.get('CLOUDINARY_WEBHOOK_SECRET')
     if not webhook_secret:
         print("⚠️ CLOUDINARY_WEBHOOK_SECRET не задан, пропускаем проверку подписи")
     else:
