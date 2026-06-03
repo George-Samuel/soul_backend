@@ -702,28 +702,6 @@ def upload_photo():
 # ========== ВЕБХУК ДЛЯ МОДЕРАЦИИ (ПРОВЕРКА ПОДПИСИ ОТКЛЮЧЕНА) ==========
 @app.route('/webhook/moderation', methods=['POST'])
 def moderation_webhook():
-    # Подпись временно не проверяем (отладка)
-    # signature = request.headers.get('X-Cld-Signature')
-    # timestamp = request.headers.get('X-Cld-Timestamp')
-    # if not signature or not timestamp:
-    #     print("🚨 Получен запрос без подписи. Отклоняем.")
-    #     return jsonify({'error': 'Missing signature'}), 401
-    #
-    # webhook_secret = os.environ.get('CLOUDINARY_WEBHOOK_SECRET')
-    # if not webhook_secret:
-    #     print("⚠️ CLOUDINARY_WEBHOOK_SECRET не задан, пропускаем проверку подписи")
-    # else:
-    #     payload_body = request.get_data(as_text=True)
-    #     signed_payload = payload_body + timestamp
-    #     expected_signature = hmac.new(
-    #         key=webhook_secret.encode('utf-8'),
-    #         msg=signed_payload.encode('utf-8'),
-    #         digestmod=hashlib.sha1
-    #     ).hexdigest()
-    #     if not hmac.compare_digest(expected_signature, signature):
-    #         print("🚨 Неверная подпись вебхука")
-    #         return jsonify({'error': 'Invalid signature'}), 401
-
     data = request.get_json()
     try:
         # Проверяем, есть ли в уведомлении данные о модерации
