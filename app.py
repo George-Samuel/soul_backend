@@ -1,3 +1,4 @@
+
 import json
 import os
 import time
@@ -5,8 +6,10 @@ import uuid
 import re
 import hmac
 import hashlib
+import io
+from urllib.parse import quote
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, func
 from sqlalchemy.ext.declarative import declarative_base
@@ -14,8 +17,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import JSONB
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-
-# ---- Cloudinary для хранения фото ----
+import requests
 import cloudinary
 import cloudinary.uploader
 
@@ -257,7 +259,8 @@ def delete_user_completely(user_id):
             prof = session.query(Profile).filter_by(user_id=user_id).first()
             if prof:
                 session.delete(prof)
-            session.query(Message).filter((Message.from_user == user_id) | (Message.to_user == user_id)).delete()
+            session.query(Message).filter((Message.from_user == user_id) | (Message.to_user == 
+user_id)).delete()
             session.commit()
         finally:
             session.close()
@@ -267,7 +270,8 @@ def delete_user_completely(user_id):
             del profiles[user_id]
             save_json(PROFILES_FILE, profiles)
         msg_db = load_json(MESSAGES_FILE)
-        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != user_id]
+        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != 
+user_id]
         save_json(MESSAGES_FILE, msg_db)
     hb = load_heartbeats()
     if user_id in hb:
@@ -335,7 +339,7 @@ def login():
         return jsonify({'error': 'Invalid password'}), 401
     return jsonify({'status': 'ok', 'user_id': user_id}), 200
 
-# Вход через Google (исправлен replaceAll -> replace)
+# Вход через Google
 @app.route('/auth/google', methods=['POST'])
 def google_auth():
     if not GOOGLE_AUTH_AVAILABLE:
@@ -343,7 +347,8 @@ def google_auth():
     token = request.json.get('idToken')
     if not token:
         return jsonify({'error': 'Missing token'}), 400
-    CLIENT_ID = '69193608569-lljeikos3ttitkug6vg05dn43mshsivq.apps.googleusercontent.com'  # ЗАМЕНИТЕ НА РЕАЛЬНЫЙ
+    CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID',
+ '69193608569-lljeikos3ttitkug6vg05dn43mshsivq.apps.googleusercontent.com')
     try:
         info = id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
         if info is None:
@@ -395,7 +400,7 @@ def get_profile(user_id):
         return jsonify(profile), 200
     return jsonify({'error': 'Not found'}), 404
 
-# Сообщения (с поддержкой image_url)
+# Сообщения
 @app.route('/send_message', methods=['POST'])
 def send_message():
     data = request.json
@@ -584,7 +589,6 @@ def stats():
     now = time.time()
     hb = load_heartbeats()
     online_now = sum(1 for ts in hb.values() if now - ts < 30)
-
     if USE_DB:
         session = SessionLocal()
         try:
@@ -605,7 +609,6 @@ def stats():
             completed = p.get('completed_at')
             if completed and completed > week_ago:
                 new_users_week += 1
-
     return jsonify({
         'total_users': total_users,
         'total_messages': total_messages,
@@ -613,27 +616,22 @@ def stats():
         'online_now': online_now,
     }), 200
 
-# ========== УДАЛЕНИЕ СООБЩЕНИЯ ==========
+# Удаление сообщения
 @app.route('/delete_message', methods=['POST'])
 def delete_message():
     data = request.json
     user_id = data.get('user_id')
     message_id = data.get('message_id')
-    
     if not user_id or not message_id:
         return jsonify({'error': 'Missing user_id or message_id'}), 400
-    
     if USE_DB and Message:
         session = SessionLocal()
         try:
             msg = session.query(Message).filter(Message.id == message_id).first()
             if not msg:
                 return jsonify({'error': 'Message not found'}), 404
-            
             if msg.from_user != user_id:
                 return jsonify({'error': 'You can only delete your own messages'}), 403
-            
-            # Если у сообщения есть фото — удаляем его из Cloudinary
             if msg.image_url and 'cloudinary.com' in msg.image_url:
                 try:
                     match = re.search(r'/upload/(?:v\d+/)?([^/.]+)(?:\.[^.]+)?$', msg.image_url)
@@ -643,12 +641,10 @@ def delete_message():
                         print(f"🗑 Удалено фото из Cloudinary: {public_id}")
                 except Exception as e:
                     print(f"⚠️ Ошибка удаления фото из Cloudinary: {e}")
-            
             session.delete(msg)
             session.commit()
             print(f"🗑 Сообщение {message_id} удалено пользователем {user_id}")
             return jsonify({'status': 'ok'}), 200
-            
         except Exception as e:
             session.rollback()
             print(f"❌ Ошибка удаления сообщения: {e}")
@@ -656,7 +652,6 @@ def delete_message():
         finally:
             session.close()
     else:
-        # JSON режим (без БД)
         msg_db = load_json(MESSAGES_FILE)
         messages = msg_db.get('messages', [])
         found = None
@@ -674,7 +669,7 @@ def delete_message():
         print(f"🗑 Сообщение {message_id} удалено из JSON")
         return jsonify({'status': 'ok'}), 200
 
-# ========== ЗАГРУЗКА ФОТО С МОДЕРАЦИЕЙ ==========
+# Загрузка фото на Cloudinary с модерацией
 YOUR_WEBHOOK_URL = 'https://soul-backend-5pcj.onrender.com/webhook/moderation'
 
 @app.route('/upload_photo', methods=['POST'])
@@ -684,7 +679,6 @@ def upload_photo():
     file = request.files['photo']
     if file.filename == '' or not allowed_file(file.filename):
         return jsonify({'error': 'Invalid file'}), 400
-
     try:
         upload_result = cloudinary.uploader.upload(
             file,
@@ -699,28 +693,57 @@ def upload_photo():
         print(f"❌ Ошибка загрузки в Cloudinary: {e}")
         return jsonify({'error': 'Failed to upload photo'}), 500
 
-# ========== ВЕБХУК ДЛЯ МОДЕРАЦИИ (ПРОВЕРКА ПОДПИСИ ОТКЛЮЧЕНА) ==========
+# Вебхук модерации (проверка подписи отключена)
 @app.route('/webhook/moderation', methods=['POST'])
 def moderation_webhook():
     data = request.get_json()
     try:
-        # Проверяем, есть ли в уведомлении данные о модерации
         if 'moderation' not in data or not data['moderation']:
             print("ℹ️ Уведомление о начале модерации или промежуточное, пропускаем")
             return jsonify({'status': 'ok'}), 200
-
         public_id = data.get('public_id')
-        moderation_status = data['moderation'][0]['status']  # 'approved' или 'rejected'
+        moderation_status = data['moderation'][0]['status']
         print(f"📸 Вердикт для {public_id}: {moderation_status}")
-
         if moderation_status == 'rejected':
             print(f"🚫 Фото {public_id} отклонено. Удаляем из Cloudinary...")
             cloudinary.uploader.destroy(public_id)
-            # Здесь можно добавить логику для уведомления пользователя
     except Exception as e:
         print(f"❌ Ошибка обработки вебхука: {e}")
-
     return jsonify({'status': 'ok'}), 200
+
+# ========== НОВЫЙ ЭНДПОИНТ ДЛЯ ГЕНЕРАЦИИ AI-АВАТАРА ==========
+@app.route('/generate_avatar', methods=['POST'])
+def generate_avatar():
+    data = request.json
+    prompt = data.get('prompt')
+    if not prompt:
+        return jsonify({'error': 'Missing prompt'}), 400
+
+    encoded_prompt = quote(prompt)
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=512&height=512&nologo=true"
+
+    secret_key = os.environ.get('POLLINATIONS_SECRET_KEY')
+    if not secret_key:
+        print('❌ POLLINATIONS_SECRET_KEY не задан')
+        return jsonify({'error': 'Server configuration error'}), 500
+
+    headers = {'Authorization': f'Bearer {secret_key}'}
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        if response.status_code == 200:
+            return send_file(
+                io.BytesIO(response.content),
+                mimetype='image/png',
+                as_attachment=False,
+                download_name='avatar.png'
+            )
+        else:
+            print(f'Pollinations error: {response.status_code} - {response.text}')
+            return jsonify({'error': 'Generation failed'}), response.status_code
+    except Exception as e:
+        print(f'Exception in generate_avatar: {e}')
+        return jsonify({'error': str(e)}), 500
 
 # ========== ЗАПУСК ==========
 if __name__ == '__main__':
