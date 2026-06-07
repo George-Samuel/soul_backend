@@ -313,7 +313,7 @@ def register():
 
     # ---------- НАЗНАЧЕНИЕ АДМИНИСТРАТОРА ПО EMAIL ----------
     # Если регистрируется пользователь с email electron.geo@gmail.com, даём ему права администратора
-    if user_id == 'electron.geo@gmail.com':
+    if user_id == 'electron_dot_geo_at_gmail_dot_com':
         data['is_admin'] = True
         print(f"👑 Пользователь {user_id} назначен администратором")
 
