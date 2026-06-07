@@ -1,4 +1,3 @@
-
 import json
 import os
 import time
@@ -6,10 +5,8 @@ import uuid
 import re
 import hmac
 import hashlib
-import io
-from urllib.parse import quote
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, func
 from sqlalchemy.ext.declarative import declarative_base
@@ -17,11 +14,10 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import JSONB
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-import requests
 import cloudinary
 import cloudinary.uploader
 
-# ---- Google Auth (опционально) ----
+# ---------- Google Auth (опционально) ----------
 try:
     from google.oauth2 import id_token
     from google.auth.transport import requests as google_requests
@@ -33,19 +29,19 @@ except ImportError:
 app = Flask(__name__)
 CORS(app)
 
-# ----- Настройка Cloudinary (основные ключи для загрузки/удаления) -----
+# ---------- Настройка Cloudinary ----------
 cloudinary.config(
     cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME'),
     api_key=os.environ.get('CLOUDINARY_API_KEY'),
     api_secret=os.environ.get('CLOUDINARY_API_SECRET')
 )
 
-# ----- Healthcheck -----
+# ---------- Healthcheck ----------
 @app.route('/')
 def home():
     return jsonify({'status': 'ok', 'message': 'Soul Pair API is running'}), 200
 
-# ----- Конфигурация базы данных -----
+# ---------- Конфигурация базы данных ----------
 DATABASE_URL = os.environ.get('DATABASE_URL')
 USE_DB = DATABASE_URL is not None
 
@@ -77,7 +73,7 @@ else:
     Profile = None
     Message = None
 
-# ----- Константы и вспомогательные функции для JSON -----
+# ---------- Константы и вспомогательные функции для JSON ----------
 PROFILES_FILE = 'profiles.json'
 MESSAGES_FILE = 'messages.json'
 HEARTBEAT_FILE = 'heartbeats.json'
@@ -120,7 +116,7 @@ def load_reports():
 def save_reports(data):
     save_json(REPORTS_FILE, data)
 
-# ----- Универсальные функции для работы с данными -----
+# ---------- Универсальные функции для работы с данными ----------
 def get_profile_data(user_id):
     if USE_DB and Profile:
         session = SessionLocal()
@@ -159,7 +155,7 @@ def is_admin(user_id):
     profile = get_profile_data(user_id)
     return profile is not None and profile.get('is_admin', False)
 
-# ----- Работа с сообщениями (поддержка image_url) -----
+# ---------- Работа с сообщениями ----------
 def save_message_db(from_user, to_user, text='', image_url=None):
     if USE_DB and Message:
         session = SessionLocal()
@@ -259,8 +255,7 @@ def delete_user_completely(user_id):
             prof = session.query(Profile).filter_by(user_id=user_id).first()
             if prof:
                 session.delete(prof)
-            session.query(Message).filter((Message.from_user == user_id) | (Message.to_user == 
-user_id)).delete()
+            session.query(Message).filter((Message.from_user == user_id) | (Message.to_user == user_id)).delete()
             session.commit()
         finally:
             session.close()
@@ -270,8 +265,7 @@ user_id)).delete()
             del profiles[user_id]
             save_json(PROFILES_FILE, profiles)
         msg_db = load_json(MESSAGES_FILE)
-        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != 
-user_id]
+        msg_db['messages'] = [m for m in msg_db.get('messages', []) if m['from'] != user_id and m['to'] != user_id]
         save_json(MESSAGES_FILE, msg_db)
     hb = load_heartbeats()
     if user_id in hb:
@@ -282,9 +276,8 @@ user_id]
         del lr[user_id]
     save_last_read(lr)
 
-# ----- ЭНДПОИНТЫ -----
-
-# Регистрация (с паролем)
+# ---------- ЭНДПОИНТЫ ----------
+# Регистрация (с паролем) – здесь добавлено условие для администратора
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
@@ -317,6 +310,13 @@ def register():
         data.setdefault('values', {})
         data.setdefault('type_scores', {})
         data.setdefault('dominant_type', None)
+
+    # ---------- НАЗНАЧЕНИЕ АДМИНИСТРАТОРА ПО EMAIL ----------
+    # Если регистрируется пользователь с email electron.geo@gmail.com, даём ему права администратора
+    if user_id == 'electron.geo@gmail.com':
+        data['is_admin'] = True
+        print(f"👑 Пользователь {user_id} назначен администратором")
+
     save_profile_data(user_id, data)
     print(f"✅ Зарегистрирован {user_id}")
     return jsonify({'status': 'ok'}), 200
@@ -347,8 +347,8 @@ def google_auth():
     token = request.json.get('idToken')
     if not token:
         return jsonify({'error': 'Missing token'}), 400
-    CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID',
- '69193608569-lljeikos3ttitkug6vg05dn43mshsivq.apps.googleusercontent.com')
+    CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', 
+'69193608569-lljeikos3ttitkug6vg05dn43mshsivq.apps.googleusercontent.com')
     try:
         info = id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
         if info is None:
@@ -371,6 +371,10 @@ def google_auth():
                 'dominant_type': None,
                 'completed_at': datetime.now().isoformat(),
             }
+            # Если email совпадает с админским, назначаем администратора
+            if email == 'electron.geo@gmail.com':
+                profile['is_admin'] = True
+                print(f"👑 Google-пользователь {user_id} назначен администратором")
             save_profile_data(user_id, profile)
         else:
             if name and name != profile.get('name'):
@@ -693,7 +697,7 @@ def upload_photo():
         print(f"❌ Ошибка загрузки в Cloudinary: {e}")
         return jsonify({'error': 'Failed to upload photo'}), 500
 
-# Вебхук модерации (проверка подписи отключена)
+# Вебхук модерации
 @app.route('/webhook/moderation', methods=['POST'])
 def moderation_webhook():
     data = request.get_json()
@@ -711,41 +715,7 @@ def moderation_webhook():
         print(f"❌ Ошибка обработки вебхука: {e}")
     return jsonify({'status': 'ok'}), 200
 
-# ========== НОВЫЙ ЭНДПОИНТ ДЛЯ ГЕНЕРАЦИИ AI-АВАТАРА ==========
-@app.route('/generate_avatar', methods=['POST'])
-def generate_avatar():
-    data = request.json
-    prompt = data.get('prompt')
-    if not prompt:
-        return jsonify({'error': 'Missing prompt'}), 400
-
-    encoded_prompt = quote(prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=512&height=512&nologo=true"
-
-    secret_key = os.environ.get('POLLINATIONS_SECRET_KEY')
-    if not secret_key:
-        print('❌ POLLINATIONS_SECRET_KEY не задан')
-        return jsonify({'error': 'Server configuration error'}), 500
-
-    headers = {'Authorization': f'Bearer {secret_key}'}
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=30)
-        if response.status_code == 200:
-            return send_file(
-                io.BytesIO(response.content),
-                mimetype='image/png',
-                as_attachment=False,
-                download_name='avatar.png'
-            )
-        else:
-            print(f'Pollinations error: {response.status_code} - {response.text}')
-            return jsonify({'error': 'Generation failed'}), response.status_code
-    except Exception as e:
-        print(f'Exception in generate_avatar: {e}')
-        return jsonify({'error': str(e)}), 500
-
-# ========== ЗАПУСК ==========
+# ---------- ЗАПУСК ----------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
