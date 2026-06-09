@@ -8,7 +8,7 @@ import hashlib
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, func
+from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, func, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import JSONB
@@ -17,7 +17,7 @@ from werkzeug.utils import secure_filename
 import cloudinary
 import cloudinary.uploader
 
-# ---------- Google Auth (опционально) ----------
+# ---- Google Auth ----
 try:
     from google.oauth2 import id_token
     from google.auth.transport import requests as google_requests
@@ -29,19 +29,19 @@ except ImportError:
 app = Flask(__name__)
 CORS(app)
 
-# ---------- Настройка Cloudinary ----------
+# ----- Cloudinary -----
 cloudinary.config(
     cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME'),
     api_key=os.environ.get('CLOUDINARY_API_KEY'),
     api_secret=os.environ.get('CLOUDINARY_API_SECRET')
 )
 
-# ---------- Healthcheck ----------
+# ----- Healthcheck -----
 @app.route('/')
 def home():
     return jsonify({'status': 'ok', 'message': 'Soul Pair API is running'}), 200
 
-# ---------- Конфигурация базы данных ----------
+# ----- Database configuration -----
 DATABASE_URL = os.environ.get('DATABASE_URL')
 USE_DB = DATABASE_URL is not None
 
@@ -65,6 +65,25 @@ if USE_DB:
         image_url = Column(Text, nullable=True)
         timestamp = Column(DateTime, default=datetime.utcnow)
 
+    # Новые модели для лайков и матчей
+    class Like(Base):
+        __tablename__ = 'likes'
+        id = Column(Integer, primary_key=True)
+        from_user_id = Column(String, nullable=False)
+        to_user_id = Column(String, nullable=False)
+        created_at = Column(DateTime, default=datetime.utcnow)
+        __table_args__ = (UniqueConstraint('from_user_id', 'to_user_id'),)
+
+    class Match(Base):
+        __tablename__ = 'matches'
+        id = Column(Integer, primary_key=True)
+        user1_id = Column(String, nullable=False)
+        user2_id = Column(String, nullable=False)
+        status = Column(String, default='pending')  # pending, confirmed, declined
+        created_at = Column(DateTime, default=datetime.utcnow)
+        confirmed_at = Column(DateTime, nullable=True)
+        __table_args__ = (UniqueConstraint('user1_id', 'user2_id'),)
+
     Base.metadata.create_all(bind=engine)
     print("✅ Подключена база данных Neon.tech")
 else:
@@ -72,8 +91,10 @@ else:
     SessionLocal = None
     Profile = None
     Message = None
+    Like = None
+    Match = None
 
-# ---------- Константы и вспомогательные функции для JSON ----------
+# ----- Константы и вспомогательные функции -----
 PROFILES_FILE = 'profiles.json'
 MESSAGES_FILE = 'messages.json'
 HEARTBEAT_FILE = 'heartbeats.json'
@@ -116,7 +137,6 @@ def load_reports():
 def save_reports(data):
     save_json(REPORTS_FILE, data)
 
-# ---------- Универсальные функции для работы с данными ----------
 def get_profile_data(user_id):
     if USE_DB and Profile:
         session = SessionLocal()
@@ -155,7 +175,7 @@ def is_admin(user_id):
     profile = get_profile_data(user_id)
     return profile is not None and profile.get('is_admin', False)
 
-# ---------- Работа с сообщениями ----------
+# ----- Работа с сообщениями -----
 def save_message_db(from_user, to_user, text='', image_url=None):
     if USE_DB and Message:
         session = SessionLocal()
@@ -276,7 +296,7 @@ def delete_user_completely(user_id):
         del lr[user_id]
     save_last_read(lr)
 
-# ---------- ЭНДПОИНТЫ ----------
+# ----- ЭНДПОИНТЫ (существующие) -----
 # Регистрация (с паролем) – здесь добавлено условие для администратора
 @app.route('/register', methods=['POST'])
 def register():
@@ -313,7 +333,7 @@ def register():
 
     # ---------- НАЗНАЧЕНИЕ АДМИНИСТРАТОРА ПО EMAIL ----------
     # Если регистрируется пользователь с email electron.geo@gmail.com, даём ему права администратора
-    if user_id == 'electron_dot_geo_at_gmail_dot_com':
+    if user_id == 'electron.geo@gmail.com':
         data['is_admin'] = True
         print(f"👑 Пользователь {user_id} назначен администратором")
 
@@ -715,7 +735,141 @@ def moderation_webhook():
         print(f"❌ Ошибка обработки вебхука: {e}")
     return jsonify({'status': 'ok'}), 200
 
-# ---------- ЗАПУСК ----------
+# ========== НОВЫЕ ЭНДПОИНТЫ ДЛЯ ЛАЙКОВ И МАТЧЕЙ ==========
+@app.route('/like', methods=['POST'])
+def like_user():
+    data = request.json
+    from_user = data.get('from_user_id')
+    to_user = data.get('to_user_id')
+    if not from_user or not to_user:
+        return jsonify({'error': 'Missing from_user_id or to_user_id'}), 400
+    if from_user == to_user:
+        return jsonify({'error': 'Cannot like yourself'}), 400
+
+    if not USE_DB:
+        return jsonify({'error': 'Database not available'}), 500
+
+    session = SessionLocal()
+    try:
+        existing = session.query(Like).filter_by(from_user_id=from_user, to_user_id=to_user).first()
+        if existing:
+            session.close()
+            return jsonify({'status': 'already_liked'}), 200
+
+        new_like = Like(from_user_id=from_user, to_user_id=to_user)
+        session.add(new_like)
+
+        reverse_like = session.query(Like).filter_by(from_user_id=to_user, to_user_id=from_user).first()
+        if reverse_like:
+            user1, user2 = sorted([from_user, to_user])
+            existing_match = session.query(Match).filter_by(user1_id=user1, user2_id=user2).first()
+            if not existing_match:
+                match = Match(user1_id=user1, user2_id=user2)
+                session.add(match)
+            session.commit()
+            session.close()
+            return jsonify({'status': 'matched'}), 200
+        else:
+            session.commit()
+            session.close()
+            return jsonify({'status': 'liked'}), 200
+    except Exception as e:
+        session.rollback()
+        session.close()
+        print(f"Error in /like: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/matches', methods=['GET'])
+def get_matches():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({'error': 'Missing user_id'}), 400
+    if not USE_DB:
+        return jsonify({'error': 'Database not available'}), 500
+
+    session = SessionLocal()
+    try:
+        matches = session.query(Match).filter(
+            (Match.user1_id == user_id) | (Match.user2_id == user_id)
+        ).all()
+        result = []
+        for m in matches:
+            other_user_id = m.user2_id if m.user1_id == user_id else m.user1_id
+            profile = get_profile_data(other_user_id)
+            result.append({
+                'match_id': m.id,
+                'user_id': other_user_id,
+                'status': m.status,
+                'created_at': m.created_at.isoformat(),
+                'confirmed_at': m.confirmed_at.isoformat() if m.confirmed_at else None,
+                'name': profile.get('name') if profile else None,
+                'avatar': profile.get('selected_avatar') if profile else None,
+            })
+        session.close()
+        return jsonify({'matches': result}), 200
+    except Exception as e:
+        session.close()
+        print(f"Error in /matches: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/confirm_match', methods=['POST'])
+def confirm_match():
+    data = request.json
+    user_id = data.get('user_id')
+    match_id = data.get('match_id')
+    if not user_id or not match_id:
+        return jsonify({'error': 'Missing user_id or match_id'}), 400
+    if not USE_DB:
+        return jsonify({'error': 'Database not available'}), 500
+
+    session = SessionLocal()
+    try:
+        match = session.query(Match).filter_by(id=match_id).first()
+        if not match:
+            session.close()
+            return jsonify({'error': 'Match not found'}), 404
+        if match.user1_id != user_id and match.user2_id != user_id:
+            session.close()
+            return jsonify({'error': 'Not authorized'}), 403
+        if match.status != 'pending':
+            session.close()
+            return jsonify({'error': 'Already confirmed or declined'}), 400
+        match.status = 'confirmed'
+        match.confirmed_at = datetime.utcnow()
+        session.commit()
+        session.close()
+        return jsonify({'status': 'confirmed'}), 200
+    except Exception as e:
+        session.rollback()
+        session.close()
+        print(f"Error in /confirm_match: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/stats/likes', methods=['GET'])
+def likes_stats():
+    admin_id = request.args.get('admin_id')
+    if not admin_id or not is_admin(admin_id):
+        return jsonify({'error': 'Forbidden'}), 403
+    if not USE_DB:
+        return jsonify({'error': 'Database not available'}), 500
+
+    session = SessionLocal()
+    try:
+        total_likes = session.query(Like).count()
+        total_matches = session.query(Match).count()
+        confirmed_matches = session.query(Match).filter_by(status='confirmed').count()
+        session.close()
+        return jsonify({
+            'total_likes': total_likes,
+            'total_matches': total_matches,
+            'confirmed_matches': confirmed_matches,
+        }), 200
+    except Exception as e:
+        session.close()
+        print(f"Error in /stats/likes: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+# ----- Запуск -----
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
